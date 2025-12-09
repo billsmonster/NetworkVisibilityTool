@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 Threat Hunter's Network Visibility Toolkit (NVT)
 ------------------------------------------------
-Author: <your name>
+Author: Derek Lenz
 Purpose: Provide automated, hunt-focused visibility into network flows,
          highlight suspicious / beacon-like / high-entropy traffic, and
          export results in formats suitable for manual analysis or SIEM ingestion.
