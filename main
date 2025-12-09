@@ -1,0 +1,727 @@
+from __future__ import annotations
+
+"""
+Threat Hunter's Network Visibility Toolkit (NVT)
+------------------------------------------------
+Author: <your name>
+Purpose: Provide automated, hunt-focused visibility into network flows,
+         highlight suspicious / beacon-like / high-entropy traffic, and
+         export results in formats suitable for manual analysis or SIEM ingestion.
+
+This tool is designed as a *defender-focused* project:
+- Automatically captures live traffic (no PCAP required)
+- Builds bi-directional flows (client/server)
+- Applies simple but realistic threat hunting heuristics
+- Flags potentially suspicious / C2-like behavior
+- Saves both full flow stats and suspicious findings
+
+Use cases:
+- Personal threat hunting lab
+- Demo project for cybersecurity portfolio
+- Baseline network behavior analysis on small segments
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple
+from collections import defaultdict
+import json
+import math
+import time
+import logging
+from datetime import datetime
+
+# ==== LOGGING CONFIGURATION =====================================
+# We use Python's logging instead of print() so this can scale up
+# (and be redirected to files or centralized logging later).
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("nvt")
+
+# ==== TOOL METADATA =============================================
+
+TOOL_NAME = "Threat Hunter's Network Visibility Toolkit (NVT)"
+TOOL_VERSION = "0.2.0"
+
+# ==== CAPTURE / OUTPUT CONFIG ==================================
+# These constants control how the tool behaves. In a more advanced version,
+# these could be loaded from a config file or CLI arguments.
+
+CAPTURE_DURATION = 30        # How long to sniff live traffic (seconds)
+MAX_PACKETS = 0              # 0 = no limit; otherwise stop after N packets
+
+# Output filenames – easy for SIEM or manual analysis later
+JSON_OUT = "nvt_findings.json"      # Structured JSON of suspicious flows
+SIEM_OUT = "nvt_siem.log"           # SIEM-friendly key=value log lines
+ALL_FLOWS_OUT = "nvt_all_flows.json"  # Summary of *all* observed flows
+
+ENABLE_ENTROPY = True        # Entropy costs CPU; can disable if needed
+
+# Global capture metadata (populated at runtime, used in JSON metadata)
+LAST_INTERFACE: str | None = None
+LAST_CAPTURE_DURATION: float | None = None
+
+# ================================================================
+# Try to detect if Scapy is installed. If not, we fail gracefully
+# instead of throwing a stack trace when user runs the script.
+
+try:
+    import scapy  # type: ignore
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+
+
+# ==== DATA STRUCTURES ===========================================
+# PacketSample and FlowStats form our core "data model" for flows.
+
+
+@dataclass
+class PacketSample:
+    """
+    Represents a single packet within a flow.
+
+    We store:
+    - timestamp: for interval / beaconing analysis
+    - size: total packet size (bytes)
+    - entropy: payload entropy, used to infer encryption or packing
+    """
+    timestamp: float
+    size: int
+    entropy: float
+
+
+@dataclass
+class FlowStats:
+    """
+    Represents a bi-directional flow between two endpoints.
+
+    Fields:
+    - src_ip, dst_ip, src_port, dst_port: normalized endpoints
+    - proto: "TCP" or "UDP"
+    - packets: list of PacketSample
+    - client_ip/server_ip: roles inferred heuristically (optional)
+
+    Properties like avg_interval, duration, etc. are derived on demand.
+    """
+    src_ip: str
+    dst_ip: str
+    src_port: int
+    dst_port: int
+    proto: str
+    packets: List[PacketSample] = field(default_factory=list)
+
+    # Optional roles, derived later based on ports
+    client_ip: str | None = None
+    server_ip: str | None = None
+
+    @property
+    def packet_count(self) -> int:
+        """Total number of packets in this flow."""
+        return len(self.packets)
+
+    @property
+    def byte_count(self) -> int:
+        """Total number of bytes across all packets in this flow."""
+        return sum(p.size for p in self.packets)
+
+    @property
+    def duration(self) -> float:
+        """Flow lifetime in seconds based on first/last packet timestamps."""
+        if not self.packets:
+            return 0.0
+        return self.packets[-1].timestamp - self.packets[0].timestamp
+
+    @property
+    def intervals(self) -> List[float]:
+        """
+        Inter-packet arrival times (in seconds).
+
+        These are crucial for detecting beaconing / periodic traffic.
+        """
+        if self.packet_count < 2:
+            return []
+        return [
+            self.packets[i + 1].timestamp - self.packets[i].timestamp
+            for i in range(self.packet_count - 1)
+        ]
+
+    @property
+    def avg_interval(self) -> float:
+        """Average inter-packet interval for this flow."""
+        intervals = self.intervals
+        if not intervals:
+            return 0.0
+        return sum(intervals) / len(intervals)
+
+    @property
+    def interval_stddev(self) -> float:
+        """Standard deviation of inter-packet intervals (jitter)."""
+        intervals = self.intervals
+        if len(intervals) < 2:
+            return 0.0
+        mean = sum(intervals) / len(intervals)
+        variance = sum((x - mean) ** 2 for x in intervals) / len(intervals)
+        return math.sqrt(variance)
+
+    @property
+    def avg_entropy(self) -> float:
+        """
+        Average Shannon entropy across payload samples in this flow.
+
+        High entropy often indicates encryption, compression, or packing,
+        which is interesting in the context of C2 channels and exfiltration.
+        """
+        if not self.packets:
+            return 0.0
+        entropies = [p.entropy for p in self.packets if p.entropy >= 0]
+        if not entropies:
+            return 0.0
+        return sum(entropies) / len(entropies)
+
+    def infer_roles(self) -> None:
+        """
+        Infer client/server roles based on ports.
+
+        Heuristic:
+        - The endpoint with the lower port is assumed to be the "server".
+        - The other endpoint is treated as the "client".
+
+        This is not perfect (e.g., P2P, ephemeral services), but it's
+        good enough to label flows for basic hunt analysis.
+        """
+        if self.client_ip is not None and self.server_ip is not None:
+            return
+
+        if self.src_port < self.dst_port:
+            self.server_ip, self.client_ip = self.src_ip, self.dst_ip
+        else:
+            self.server_ip, self.client_ip = self.dst_ip, self.src_ip
+
+
+# Type aliases for readability
+FlowKey = Tuple[Tuple[str, int], Tuple[str, int], str]
+FlowsDict = Dict[FlowKey, FlowStats]
+
+# Common well-known ports for context. Anything not here and >1024
+# is "rare" and potentially interesting when combined with other signals.
+COMMON_PORTS = {
+    20, 21, 22, 23, 25, 53, 67, 68, 69, 80, 110, 123,
+    135, 139, 143, 161, 162, 389, 443, 445, 465, 514,
+    587, 993, 995, 1433, 1521, 1723, 3306, 3389, 5060,
+    5432, 5900, 8000, 8080, 8443,
+}
+
+
+@dataclass
+class DetectionConfig:
+    """
+    Tunable detection heuristics.
+
+    These values control how aggressive or conservative the analytics are.
+    They are intentionally exposed so a threat hunter can adjust to the
+    environment (e.g., noisy lab vs. production network).
+    """
+    min_packets_for_flow: int = 5                 # Ignore tiny, noisy flows
+    min_packets_for_beacon: int = 6               # Need at least this many to say "beacon-like"
+    min_duration_for_beacon: float = 30.0         # Flow must live at least this long
+    max_beacon_interval: float = 120.0            # Max mean interval for beacon (seconds)
+    jitter_ratio_threshold: float = 0.2           # Stddev must be < 20% of mean for low jitter
+    high_entropy_threshold: float = 7.0           # Out of max ~8 bits of entropy
+    small_flow_max_bytes: int = 5000              # Many small packets, low bytes = possible C2
+    small_flow_min_packets: int = 20              # "Small" in bytes but many packets
+    min_suspicion_to_report: int = 2              # Only export flows with score >= this
+    min_suspicion_for_c2: int = 4                 # Score >= this -> "possible_c2 = True"
+
+
+# Global detection config
+DETECTION_CFG = DetectionConfig()
+
+
+# ==== LOW-LEVEL ANALYTICS HELPERS ===============================
+
+def shannon_entropy(data: bytes) -> float:
+    """
+    Compute Shannon entropy of a byte sequence.
+
+    Entropy close to 8 bits/byte suggests random-looking data (e.g., encrypted,
+    compressed, or packed). Lower entropy suggests more structured content.
+    """
+    if not data:
+        return -1.0
+    freq: Dict[int, int] = defaultdict(int)
+    for b in data:
+        freq[b] += 1
+    length = len(data)
+    ent = 0.0
+    for count in freq.values():
+        p = count / length
+        ent -= p * math.log2(p)
+    return ent
+
+
+def is_rare_port(port: int) -> bool:
+    """
+    Simple heuristic: a 'rare' port is one that is not in COMMON_PORTS
+    and is >1024 (avoiding ephemeral noise on very low ports).
+    """
+    return port > 1024 and port not in COMMON_PORTS
+
+
+def make_flow_key(
+    src_ip: str,
+    dst_ip: str,
+    src_port: int,
+    dst_port: int,
+    proto: str,
+) -> FlowKey:
+    """
+    Construct a bi-directional flow key.
+
+    By sorting endpoints, A->B and B->A map to the same FlowStats.
+    This is useful because many C2 channels are bi-directional but
+    we want to treat them as a single logical flow, not two.
+    """
+    endpoints = sorted([(src_ip, src_port), (dst_ip, dst_port)])
+    return (endpoints[0], endpoints[1], proto)
+
+
+def process_packet(pkt, flows: FlowsDict) -> None:
+    """
+    Convert a Scapy packet into a PacketSample and attach it to
+    the appropriate bi-directional FlowStats object.
+
+    This is the core "ingest" function for the flow engine.
+    """
+    from scapy.layers.inet import IP, TCP, UDP
+    from scapy.packet import Raw
+
+    # Not interested in non-IP packets (ARP, etc.) for this use case
+    if not pkt.haslayer(IP):
+        return
+
+    ip = pkt[IP]
+    proto = None
+    src_port = 0
+    dst_port = 0
+
+    if pkt.haslayer(TCP):
+        tcp = pkt[TCP]
+        proto = "TCP"
+        src_port = int(tcp.sport)
+        dst_port = int(tcp.dport)
+    elif pkt.haslayer(UDP):
+        udp = pkt[UDP]
+        proto = "UDP"
+        src_port = int(udp.sport)
+        dst_port = int(udp.dport)
+    else:
+        # Ignore non-TCP/UDP traffic in this implementation (could extend later)
+        return
+
+    key = make_flow_key(ip.src, ip.dst, src_port, dst_port, proto)
+
+    # Optional entropy sampling on first 256 bytes of payload
+    if ENABLE_ENTROPY and pkt.haslayer(Raw):
+        payload_bytes = bytes(pkt[Raw].load)[:256]
+        entropy = shannon_entropy(payload_bytes)
+    else:
+        entropy = -1.0  # sentinel value meaning "no entropy computed"
+
+    sample = PacketSample(
+        timestamp=float(pkt.time),
+        size=len(pkt),
+        entropy=entropy,
+    )
+
+    # Initialize flow if we've never seen this key
+    if key not in flows:
+        (ep1, ep2, _) = key
+        flows[key] = FlowStats(
+            src_ip=ep1[0],
+            dst_ip=ep2[0],
+            src_port=ep1[1],
+            dst_port=ep2[1],
+            proto=proto,
+        )
+
+    # Attach the new packet sample to the flow
+    flows[key].packets.append(sample)
+
+
+# ==== CORE DETECTION LOGIC ======================================
+
+def analyze_flows(
+    flows: FlowsDict,
+    cfg: DetectionConfig = DETECTION_CFG,
+) -> List[Dict]:
+    """
+    Apply heuristic-based analytics to all flows and return a list
+    of *suspicious* flows with rich context.
+
+    Heuristics:
+    - Rare ports (likely unusual services)
+    - Beacon-like timing (low jitter, recurring intervals)
+    - High payload entropy (possible encryption)
+    - Many small packets (typical of C2 pings)
+    """
+    findings: List[Dict] = []
+
+    for key, flow in flows.items():
+        # Ignore tiny flows that are unlikely to be useful for hunting
+        if flow.packet_count < cfg.min_packets_for_flow:
+            continue
+
+        rare_port = is_rare_port(flow.dst_port)
+        avg_int = flow.avg_interval
+        std_int = flow.interval_stddev
+        duration = flow.duration
+        avg_ent = flow.avg_entropy
+
+        # Infer client/server roles BEFORE exporting
+        flow.infer_roles()
+
+        # --- Beacon-like behavior detection ---
+        beacon_like = False
+        if flow.packet_count >= cfg.min_packets_for_beacon and duration > cfg.min_duration_for_beacon:
+            # We want flows with:
+            # - Enough samples (packets)
+            # - Reasonable inter-packet delay
+            # - Low jitter (stddev small relative to mean)
+            if 0 < avg_int < cfg.max_beacon_interval and std_int < avg_int * cfg.jitter_ratio_threshold:
+                beacon_like = True
+
+        # --- High-entropy detection ---
+        high_entropy = avg_ent > cfg.high_entropy_threshold
+
+        # --- Suspicion scoring ---
+        # We use a simple additive score. In a real system, you might use
+        # weights tuned per environment, ML, etc.
+        suspicion_score = 0
+        if rare_port:
+            suspicion_score += 2
+        if beacon_like:
+            suspicion_score += 2
+        if high_entropy:
+            suspicion_score += 1
+        if flow.byte_count < cfg.small_flow_max_bytes and flow.packet_count > cfg.small_flow_min_packets:
+            suspicion_score += 1
+
+        if suspicion_score >= cfg.min_suspicion_to_report:
+            findings.append(
+                {
+                    "src_ip": flow.src_ip,
+                    "dst_ip": flow.dst_ip,
+                    "src_port": flow.src_port,
+                    "dst_port": flow.dst_port,
+                    "protocol": flow.proto,
+                    "client_ip": flow.client_ip,
+                    "server_ip": flow.server_ip,
+                    "packet_count": flow.packet_count,
+                    "byte_count": flow.byte_count,
+                    "duration_sec": round(duration, 2),
+                    "avg_interval_sec": round(avg_int, 3),
+                    "interval_stddev_sec": round(std_int, 3),
+                    "avg_payload_entropy": round(avg_ent, 3),
+                    "rare_port": rare_port,
+                    "beacon_like": beacon_like,
+                    "high_entropy": high_entropy,
+                    "suspicion_score": suspicion_score,
+                    "possible_c2": suspicion_score >= cfg.min_suspicion_for_c2,
+                }
+            )
+    return findings
+
+
+# ==== EXPORT FUNCTIONS ==========================================
+
+def export_findings_json(findings: List[Dict], outfile: str) -> None:
+    """
+    Export suspicious findings along with metadata:
+    - Tool name and version
+    - Generation timestamp (UTC)
+    - Capture interface and duration
+
+    This is ideal for offline analysis or ingestion into other tools.
+    """
+    doc = {
+        "tool": TOOL_NAME,
+        "version": TOOL_VERSION,
+        "generated_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "capture": {
+            "interface": LAST_INTERFACE,
+            "duration_sec": LAST_CAPTURE_DURATION,
+            "finding_count": len(findings),
+        },
+        "findings": findings,
+    }
+    try:
+        with open(outfile, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=2)
+        logger.info("Saved JSON findings to %s", outfile)
+    except OSError as e:
+        logger.error("Failed to write JSON findings to %s: %s", outfile, e)
+
+
+def export_findings_siem(findings: List[Dict], outfile: str) -> None:
+    """
+    Export suspicious findings as key=value log lines, suitable for:
+    - SIEM ingestion (Splunk, Elastic, Sentinel, etc.)
+    - Simple grep/awk/tail workflows
+
+    Each line is one flow with rich context.
+    """
+    try:
+        with open(outfile, "w", encoding="utf-8") as f:
+            for item in findings:
+                ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                line = (
+                    f"time={ts} "
+                    f"src_ip={item['src_ip']} dst_ip={item['dst_ip']} "
+                    f"src_port={item['src_port']} dst_port={item['dst_port']} "
+                    f"proto={item['protocol']} packets={item['packet_count']} "
+                    f"bytes={item['byte_count']} duration={item['duration_sec']} "
+                    f"avg_int={item['avg_interval_sec']} std_int={item['interval_stddev_sec']} "
+                    f"entropy={item['avg_payload_entropy']} rare_port={item['rare_port']} "
+                    f"beacon_like={item['beacon_like']} high_entropy={item['high_entropy']} "
+                    f"suspicion_score={item['suspicion_score']} "
+                    f"possible_c2={item['possible_c2']} "
+                    f"client_ip={item['client_ip']} server_ip={item['server_ip']}"
+                )
+                f.write(line + "\n")
+        logger.info("Saved SIEM-style log to %s", outfile)
+    except OSError as e:
+        logger.error("Failed to write SIEM log to %s: %s", outfile, e)
+
+
+def export_all_flows(flows: FlowsDict, outfile: str) -> None:
+    """
+    Export summary statistics for *all* flows, suspicious or not.
+
+    This is valuable for:
+    - Establishing baselines
+    - Offline hunting
+    - Comparing "normal" vs "suspicious" behavior
+    """
+    data = []
+    for flow in flows.values():
+        flow.infer_roles()
+        data.append(
+            {
+                "src_ip": flow.src_ip,
+                "dst_ip": flow.dst_ip,
+                "src_port": flow.src_port,
+                "dst_port": flow.dst_port,
+                "protocol": flow.proto,
+                "client_ip": flow.client_ip,
+                "server_ip": flow.server_ip,
+                "packet_count": flow.packet_count,
+                "byte_count": flow.byte_count,
+                "duration_sec": round(flow.duration, 2),
+                "avg_interval_sec": round(flow.avg_interval, 3),
+                "interval_stddev_sec": round(flow.interval_stddev, 3),
+                "avg_payload_entropy": round(flow.avg_entropy, 3),
+            }
+        )
+    try:
+        with open(outfile, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        logger.info("Saved all flow stats to %s", outfile)
+    except OSError as e:
+        logger.error("Failed to write all flows to %s: %s", outfile, e)
+
+
+# ==== INTERFACE SELECTION & CAPTURE =============================
+
+def auto_select_interface() -> str:
+    """
+    Choose a valid sniffing interface using Scapy's helpers.
+
+    Strategy:
+    1. Prefer get_working_if() -> Scapy's idea of a "good" interface.
+    2. Fallback to conf.iface -> default interface.
+    3. As a last resort, pick the first from get_if_list().
+    """
+    from scapy.all import conf
+    try:
+        # Some Scapy versions provide these helpers under scapy.interfaces
+        from scapy.interfaces import get_working_if, get_if_list  # type: ignore
+    except ImportError:
+        get_working_if = None
+        get_if_list = None
+
+    # 1) Try working interface object
+    try:
+        if get_working_if is not None:
+            w_if = get_working_if()
+            if w_if is not None:
+                logger.info("Auto-selected working interface: %s", w_if.name)
+                return w_if.name
+    except Exception as e:
+        logger.warning("get_working_if() failed: %s", e)
+
+    # 2) Fallback: Scapy default iface (string)
+    try:
+        if conf.iface:
+            logger.info("Auto-selected Scapy default interface: %s", conf.iface)
+            return str(conf.iface)
+    except Exception as e:
+        logger.warning("conf.iface lookup failed: %s", e)
+
+    # 3) Last resort: first interface from list
+    try:
+        if get_if_list is not None:
+            if_list = get_if_list()
+            if if_list:
+                logger.info("Auto-selected first interface from list: %s", if_list[0])
+                return if_list[0]
+    except Exception as e:
+        logger.error("get_if_list() failed: %s", e)
+
+    # If we reach this point, we could not find any usable interface
+    raise RuntimeError("No suitable network interface found for sniffing.")
+
+
+def capture_live_auto(
+    duration: int,
+    max_packets: int,
+) -> FlowsDict:
+    """
+    Automatically select an interface and capture live traffic
+    for the configured duration / packet limit.
+
+    Returns:
+        A dictionary mapping flow keys to FlowStats objects.
+    """
+    from scapy.all import sniff
+
+    global LAST_INTERFACE, LAST_CAPTURE_DURATION
+
+    try:
+        iface = auto_select_interface()
+    except RuntimeError as e:
+        logger.error("%s", e)
+        return {}
+
+    flows: FlowsDict = {}
+
+    def _callback(pkt):
+        """Callback invoked for every captured packet."""
+        try:
+            process_packet(pkt, flows)
+        except Exception as e:
+            # In a production system we might want more robust error handling,
+            # but logging is sufficient for this toolkit.
+            logger.error("Error processing packet: %s", e)
+
+    logger.info(
+        "Starting live capture on interface '%s' for %d seconds...",
+        iface,
+        duration,
+    )
+
+    start = time.time()
+    try:
+        sniff(
+            iface=iface,
+            prn=_callback,
+            store=False,
+            timeout=duration,
+            count=max_packets if max_packets > 0 else 0,
+        )
+    except PermissionError:
+        logger.error(
+            "PermissionError: You probably need to run as Administrator (Windows) "
+            "or with sudo (Linux)."
+        )
+    except Exception as e:
+        logger.error("Error during sniffing: %s", e)
+
+    end = time.time()
+    LAST_INTERFACE = iface
+    LAST_CAPTURE_DURATION = end - start
+
+    logger.info("Capture finished. Collected %d flows.", len(flows))
+    return flows
+
+
+# ==== MAIN ORCHESTRATION FUNCTION ===============================
+
+def run_nvt() -> None:
+    """
+    Top-level orchestration:
+
+    1. Verify Scapy is available.
+    2. Auto-capture live traffic.
+    3. Export *all* flows.
+    4. Run detection analytics.
+    5. Export suspicious flows in JSON + SIEM formats.
+    """
+    if not SCAPY_AVAILABLE:
+        logger.error(
+            "Scapy is not installed. Install it with 'pip install scapy' "
+            "in your virtualenv and run again."
+        )
+        return
+
+    logger.info("=== %s ===", TOOL_NAME)
+    logger.info(
+        "Version %s | Mode: fully automatic live capture, auto-selected interface, no PCAP required.",
+        TOOL_VERSION,
+    )
+
+    # 1) Capture traffic
+    flows = capture_live_auto(CAPTURE_DURATION, MAX_PACKETS)
+
+    if not flows:
+        logger.warning("No flows captured. Check permissions or network activity.")
+        return
+
+    total_packets = sum(flow.packet_count for flow in flows.values())
+    logger.info(
+        "Capture stats: %d flows, %d packets over %.2f seconds (~%.2f packets/sec).",
+        len(flows),
+        total_packets,
+        LAST_CAPTURE_DURATION or 0.0,
+        (total_packets / LAST_CAPTURE_DURATION) if LAST_CAPTURE_DURATION and LAST_CAPTURE_DURATION > 0 else 0.0,
+    )
+
+    # 2) Export all flows for baseline / context
+    export_all_flows(flows, ALL_FLOWS_OUT)
+
+    # 3) Analyze flows and export suspicious ones
+    findings = analyze_flows(flows, DETECTION_CFG)
+
+    logger.info("Detected %d suspicious flows.", len(findings))
+    for f_item in findings:
+        logger.warning(
+            "Suspicious flow: %s:%d -> %s:%d proto=%s score=%d possible_c2=%s",
+            f_item["src_ip"],
+            f_item["src_port"],
+            f_item["dst_ip"],
+            f_item["dst_port"],
+            f_item["protocol"],
+            f_item["suspicion_score"],
+            f_item["possible_c2"],
+        )
+
+    export_findings_json(findings, JSON_OUT)
+    export_findings_siem(findings, SIEM_OUT)
+
+    logger.info(
+        "Done. Artifacts:\n"
+        "  - Suspicious findings JSON: %s\n"
+        "  - Suspicious findings SIEM log: %s\n"
+        "  - All flow stats JSON: %s",
+        JSON_OUT,
+        SIEM_OUT,
+        ALL_FLOWS_OUT,
+    )
+
+
+# ==== ENTRY POINT ===============================================
+
+if __name__ == "__main__":
+    run_nvt()
