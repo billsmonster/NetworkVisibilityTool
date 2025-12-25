@@ -1,7 +1,4 @@
-Here is a **professional, GitHub-ready README** for your project.
-It’s clean, clear, portfolio-friendly, and written in a real security-tool style.
 
----
 
 # **Threat Hunter's Network Visibility Toolkit (NVT)**
 
